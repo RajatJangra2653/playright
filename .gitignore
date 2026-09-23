@@ -1,0 +1,6 @@
+.venv/
+users.xlsx
+*.xlsx
+!*.template.xlsx
+__pycache__/
+*.pyc
