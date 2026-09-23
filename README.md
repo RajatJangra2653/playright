@@ -1,22 +1,25 @@
 # GitHub (Azure AD SSO) login checker
 
 Playwright automation that reads users from an Excel file and, for each one,
-drives a real browser through the **GitHub → Azure AD (Entra) SSO** login flow,
-then writes back whether that user could sign in.
+drives a real browser through the **GitHub → Azure AD (Entra) SSO** login flow
+using a **userPrincipalName + Temporary Access Pass (TAP)**, then writes back
+whether that user could sign in.
 
 Intended for an admin verifying access for accounts in **their own**
 organization.
 
 ## What it does
 
-For every row in `users.xlsx` it:
+For every row in `State of Maryland.xlsx` (sheet `Users`) it:
 
 1. Opens `https://github.com/login` (configurable) in a real Chromium browser.
-2. Follows the redirect chain to Azure AD, entering the `azure_login` and
-   `azure_password`. (If the org shows GitHub's classic username/password form
-   instead, it uses `github_username` + `github_password`, falling back to
-   `azure_password`.)
-3. Determines the outcome and writes it back to the same row:
+2. Types the `GitHub_Username` and clicks **"Sign in with your identity
+   provider"** to hand off to Azure AD.
+3. On Azure AD, enters the `userPrincipalName` and the `tap` (Temporary Access
+   Pass) in place of a password. (If a row has no TAP it falls back to
+   `password`; if the org shows GitHub's classic form instead, it uses
+   `GitHub_Username` + `github_password`.)
+4. Determines the outcome and writes it back to the same row:
 
 | status         | meaning                                                        |
 |----------------|----------------------------------------------------------------|
@@ -24,7 +27,7 @@ For every row in `users.xlsx` it:
 | `FAILED`       | Credentials were rejected by Azure AD or GitHub.               |
 | `MFA_REQUIRED` | Sign-in needs an MFA / 2FA step that can't run unattended.     |
 | `ERROR`        | Couldn't determine the outcome (timeout, bot challenge, etc.). |
-| `SKIPPED`      | Row was missing `azure_login` / `azure_password`.              |
+| `SKIPPED`      | Row was missing `userPrincipalName` or TAP/`password`.         |
 
 It also fills `detail` (explanation) and `checked_at` (timestamp), and **saves
 after every user**, so progress is never lost if a run is interrupted.
@@ -38,16 +41,21 @@ bash setup.sh          # creates .venv, installs deps, downloads Chromium
 ## Prepare your data
 
 ```bash
-./.venv/bin/python make_template.py   # creates users.xlsx with the right columns
+./.venv/bin/python make_template.py   # optional: creates a blank workbook with the right columns
 ```
 
-Open `users.xlsx` and fill in real rows. Columns:
+Use the shared `State of Maryland.xlsx` (sheet `Users`), or run
+`make_template.py` for a blank one. Columns:
 
-- `github_username` – identifies the user / GitHub account
-- `azure_login` – the Azure AD email/UPN used to sign in
-- `azure_password` – the Azure AD password
+- `userPrincipalName` – the Azure AD UPN used to sign in
+- `password` – the Azure AD password (*optional*; only used when a row has no TAP)
+- `tap` – the Temporary Access Pass, entered in place of the password
+- `GitHub_Username` – the GitHub (EMU) username typed on the GitHub page
 - `github_password` – *optional*; only used if the org shows GitHub's classic
-  login form. Leave blank to fall back to `azure_password`.
+  login form. Leave blank to fall back to `password`.
+
+> TAPs are single-use / time-limited. Generate fresh passes before a run, and
+> expect `FAILED` on rows whose TAP has already expired or been consumed.
 
 (`status`, `detail`, `checked_at` are written by the tool — leave them blank.)
 
@@ -85,7 +93,7 @@ By default rows that already have a `status` are skipped; use `--recheck` to red
   The flow auto-detects the common Microsoft and GitHub screens; if your org
   uses different fields, adjust the selectors in `attempt_login()` and the
   `start_url` in `config.json`.
-- **Credentials are sensitive.** `users.xlsx` holds plaintext passwords and is
+- **Credentials are sensitive.** The workbook holds plaintext passwords/TAPs and is
   git-ignored. Keep it protected and delete it when you're done. Only run this
   against accounts you're authorized to test.
 - Repeated automated sign-ins can trigger account lockouts or security alerts;
@@ -94,7 +102,7 @@ By default rows that already have a `status` are skipped; use `--recheck` to red
 ## Files
 
 - `check_logins.py` – the automation
-- `make_template.py` – creates a starter `users.xlsx`
+- `make_template.py` – creates a starter workbook
 - `config.json` – settings
 - `setup.sh` – installs everything
 - `requirements.txt` – Python dependencies

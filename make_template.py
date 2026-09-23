@@ -10,10 +10,10 @@ cols = cfg["columns"]
 out = Path(cfg["excel_file"])
 
 headers = [
-    cols["github_username"],
-    cols["azure_login"],
-    cols["azure_password"],
-    "github_password",     # optional; leave blank to fall back to azure_password
+    cols["azure_login"],      # userPrincipalName
+    cols["azure_password"],   # password (optional fallback)
+    cols["azure_tap"],        # Temporary Access Pass (preferred secret)
+    cols["github_username"],  # GitHub_Username
     cols["status"],
     cols["detail"],
     cols["checked_at"],
@@ -21,17 +21,17 @@ headers = [
 
 wb = Workbook()
 ws = wb.active
-ws.title = "users"
+ws.title = cfg.get("sheet_name") or "Users"
 ws.append(headers)
 for cell in ws[1]:
     cell.font = Font(bold=True)
 
 # Example rows — replace with real data.
-ws.append(["alice_org", "alice@contoso.com", "REPLACE_ME", "", "", "", ""])
-ws.append(["bob_org", "bob@contoso.com", "REPLACE_ME", "", "", "", ""])
+ws.append(["user01@example.com", "REPLACE_ME", "REPLACE_TAP", "user01_org", "", "", ""])
+ws.append(["user02@example.com", "REPLACE_ME", "REPLACE_TAP", "user02_org", "", "", ""])
 
 # Widen columns a little for readability.
-widths = [20, 28, 18, 18, 14, 60, 22]
+widths = [32, 18, 18, 22, 14, 60, 22]
 for i, w in enumerate(widths, start=1):
     ws.column_dimensions[chr(64 + i)].width = w
 

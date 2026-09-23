@@ -1,13 +1,14 @@
 {
-  "excel_file": "users.xlsx",
-  "sheet_name": null,
+  "excel_file": "State of Maryland.xlsx",
+  "sheet_name": "Users",
 
   "start_url": "https://github.com/login",
 
   "columns": {
-    "github_username": "github_username",
-    "azure_login": "azure_login",
-    "azure_password": "azure_password",
+    "github_username": "GitHub_Username",
+    "azure_login": "userPrincipalName",
+    "azure_tap": "tap",
+    "azure_password": "password",
     "status": "status",
     "detail": "detail",
     "checked_at": "checked_at"

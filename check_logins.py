@@ -6,11 +6,19 @@ Reads users from an Excel file, and for each row drives a real browser through
 the GitHub login -> Azure AD SSO flow, then writes back whether the user was
 able to sign in successfully.
 
+Login flow (matches the "State of Maryland" workbook):
+  1. Open https://github.com/login and type the GitHub username.
+  2. Click "Sign in with your identity provider" to hand off to Azure AD.
+  3. On Azure AD, enter the userPrincipalName (UPN) and the Temporary Access
+     Pass (TAP) instead of a password.
+  4. Write back whether the user reached an authenticated GitHub session.
+
 Excel columns (names configurable in config.json):
-  github_username  - identifies the user / GitHub account
-  azure_login      - the Azure AD (Entra) email/UPN used to sign in
-  azure_password   - the Azure AD password
-  github_password  - OPTIONAL. Used if the org shows GitHub's classic
+  github_username  - the GitHub (EMU) username entered on the GitHub page
+  azure_login      - the Azure AD (Entra) userPrincipalName used to sign in
+  azure_tap        - the Temporary Access Pass (used in place of the password)
+  azure_password   - OPTIONAL fallback secret, used only when a row has no TAP
+  github_password  - OPTIONAL. Used only if the org shows GitHub's classic
                      username/password form instead of redirecting to Azure.
                      Falls back to azure_password if the column is absent/blank.
 
@@ -42,13 +50,14 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 # --------------------------------------------------------------------------- #
 def load_config(path: str) -> dict:
     defaults = {
-        "excel_file": "users.xlsx",
-        "sheet_name": None,
+        "excel_file": "State of Maryland.xlsx",
+        "sheet_name": "Users",
         "start_url": "https://github.com/login",
         "columns": {
-            "github_username": "github_username",
-            "azure_login": "azure_login",
-            "azure_password": "azure_password",
+            "github_username": "GitHub_Username",
+            "azure_login": "userPrincipalName",
+            "azure_tap": "tap",
+            "azure_password": "password",
             "github_password": "github_password",
             "status": "status",
             "detail": "detail",
@@ -156,6 +165,29 @@ def _safe_fill(page, selector, value, timeout=6000):
         return False
 
 
+def _field_value(page, selector):
+    """Return the current value of an input, or '' if unavailable."""
+    try:
+        return page.locator(selector).first.input_value(timeout=800) or ""
+    except Exception:
+        return ""
+
+
+def _fill_and_verify(page, selector, value, timeout=6000):
+    """Fill a field and confirm the value stuck (retry once). Returns bool."""
+    for _ in range(2):
+        if not _safe_fill(page, selector, value, timeout=timeout):
+            continue
+        if _field_value(page, selector) == value:
+            return True
+        # Value didn't stick (typeahead/overlay) — clear and retry.
+        try:
+            page.locator(selector).first.fill("", timeout=1500)
+        except Exception:
+            pass
+    return _field_value(page, selector) == value
+
+
 def _text_present(page, needles, timeout=800):
     try:
         body = page.locator("body").inner_text(timeout=timeout).lower()
@@ -164,14 +196,23 @@ def _text_present(page, needles, timeout=800):
     return any(n.lower() in body for n in needles)
 
 
-def attempt_login(page, cfg, github_username, azure_login, azure_password,
-                  github_password):
+def attempt_login(page, cfg, github_username, azure_login, azure_tap,
+                  azure_password, github_password):
     """
     Drive the browser through the login chain. Returns (status, detail).
     status in {SUCCESS, FAILED, MFA_REQUIRED, ERROR}.
+
+    Flow: GitHub username -> "Sign in with your identity provider" -> Azure AD
+    (UPN + Temporary Access Pass).
     """
     step_to = cfg["step_timeout_ms"]
     success_sub = cfg["success_url_substring"]
+
+    # The Azure secret is the TAP; fall back to a password only if no TAP given.
+    azure_secret = azure_tap or azure_password
+    secret_kind = "TAP" if azure_tap else "password"
+    if not azure_secret:
+        return "ERROR", "Row has neither a Temporary Access Pass nor a password."
 
     page.set_default_timeout(step_to)
     try:
@@ -180,13 +221,15 @@ def attempt_login(page, cfg, github_username, azure_login, azure_password,
     except PWTimeout:
         return "ERROR", f"Timed out loading start_url {cfg['start_url']}"
 
+    filled_gh_user = False
+    clicked_idp = False
     filled_ms_user = False
-    filled_ms_pass = False
-    filled_gh = False
+    filled_ms_secret = False
+    secret_submits = 0
 
     # The login can bounce GitHub <-> Microsoft several times; loop until we
     # reach a terminal state or run out of iterations.
-    for _ in range(24):
+    for _ in range(28):
         page.wait_for_timeout(600)  # let redirects settle
         url = page.url.lower()
 
@@ -194,37 +237,55 @@ def attempt_login(page, cfg, github_username, azure_login, azure_password,
         if success_sub in url and _logged_into_github(page, github_username):
             return "SUCCESS", f"Signed in to GitHub as expected (url={page.url})"
 
-        # ---- Microsoft: MFA / additional verification -----------------------
-        if _is_mfa_challenge(page):
-            return ("MFA_REQUIRED",
-                    "Azure AD requested MFA / additional verification "
-                    "(cannot be completed unattended).")
-
         # ---- Microsoft: explicit credential error ---------------------------
         ms_err = _microsoft_error(page)
         if ms_err:
             return "FAILED", f"Azure AD rejected sign-in: {ms_err}"
 
-        # ---- Microsoft: email/username step ---------------------------------
-        if _visible(page, 'input[name="loginfmt"]'):
-            if filled_ms_user:
-                # Field reappeared -> usually an unrecognized account.
-                return "FAILED", "Azure AD did not accept the account (loginfmt)."
-            if not _safe_fill(page, 'input[name="loginfmt"]', azure_login):
-                return "ERROR", "Azure AD username field was not editable (possible bot challenge)."
+        # ---- Microsoft: username (UPN) step ---------------------------------
+        # The first Azure screen asks for the userPrincipalName. Fill ONLY the
+        # username here (some tenants also render a hidden/adjacent password box,
+        # but the flow is username-first).
+        loginfmt_vis = _visible(page, 'input[name="loginfmt"]', timeout=700)
+        if loginfmt_vis and not filled_ms_user:
+            if not _fill_and_verify(page, 'input[name="loginfmt"]', azure_login):
+                return "ERROR", ("Azure AD username field was not editable "
+                                 "(possible bot challenge).")
             _click_first(page, ['#idSIButton9', 'input[type="submit"]',
                                 'button[type="submit"]'])
             filled_ms_user = True
             continue
 
-        # ---- Microsoft: password step ---------------------------------------
-        if _visible(page, 'input[name="passwd"]'):
-            if not _safe_fill(page, 'input[name="passwd"]', azure_password):
-                return "ERROR", "Azure AD password field was not editable (possible bot challenge)."
-            _click_first(page, ['#idSIButton9', 'input[type="submit"]',
-                                'button[type="submit"]'])
-            filled_ms_pass = True
+        # ---- Microsoft: Temporary Access Pass / password step ---------------
+        # Only after the UPN has been submitted do we enter the secret, so we
+        # never type it into the username screen's adjacent password box.
+        if filled_ms_user:
+            secret_sel = _azure_secret_field(page)
+            if secret_sel:
+                if not _fill_and_verify(page, secret_sel, azure_secret):
+                    return "ERROR", (f"Azure AD {secret_kind} field was not "
+                                     "editable (possible bot challenge).")
+                _click_first(page, ['#idSIButton9', '#idA_SAOTCC_Continue',
+                                    'input[type="submit"]', 'button[type="submit"]'])
+                filled_ms_secret = True
+                secret_submits += 1
+                if secret_submits > 3:
+                    # Field keeps coming back -> the secret isn't being accepted.
+                    return "FAILED", f"Azure AD did not accept the {secret_kind}."
+                continue
+            # UPN screen reappeared after we submitted it -> account not accepted.
+            if loginfmt_vis:
+                return "FAILED", "Azure AD did not accept the account (loginfmt)."
+
+        # ---- Microsoft: offer to switch to the Temporary Access Pass --------
+        if azure_tap and _switch_to_tap(page):
             continue
+
+        # ---- Microsoft: MFA / additional verification -----------------------
+        if _is_mfa_challenge(page):
+            return ("MFA_REQUIRED",
+                    "Azure AD requested MFA / additional verification "
+                    "(cannot be completed unattended).")
 
         # ---- Microsoft: "Stay signed in?" -----------------------------------
         if _text_present(page, ["stay signed in"]) or _visible(page, "#idBtn_Back"):
@@ -233,17 +294,34 @@ def attempt_login(page, cfg, github_username, azure_login, azure_password,
                 _click_first(page, ["#idSIButton9", 'input[type="submit"]'])
             continue
 
-        # ---- GitHub: classic username/password form -------------------------
-        if _visible(page, "#login_field") and _visible(page, "#password"):
-            gh_pw = github_password or azure_password
-            _safe_fill(page, "#login_field", github_username)
-            if not _safe_fill(page, "#password", gh_pw):
-                return "ERROR", ("GitHub password field was not editable "
-                                 "(GitHub often blocks headless browsers — "
-                                 "try headless=false).")
-            _click_first(page, ['input[name="commit"]', 'button[type="submit"]',
-                                'input[type="submit"]'])
-            filled_gh = True
+        # ---- GitHub: username + "Sign in with your identity provider" -------
+        if _visible(page, "#login_field"):
+            if not filled_gh_user:
+                if not _safe_fill(page, "#login_field", github_username):
+                    return "ERROR", ("GitHub username field was not editable "
+                                     "(GitHub often blocks headless browsers — "
+                                     "try headless=false).")
+                filled_gh_user = True
+                # Typing an EMU username flips the submit button to
+                # "Sign in with your identity provider"; give the UI a beat and
+                # re-evaluate on the next loop iteration.
+                page.wait_for_timeout(900)
+                continue
+            if _click_identity_provider(page):
+                clicked_idp = True
+                continue
+            # No IdP button on this page: fall back to the classic form if the
+            # password box is present.
+            if _visible(page, "#password"):
+                gh_pw = github_password or azure_password
+                if gh_pw and _safe_fill(page, "#password", gh_pw):
+                    _click_first(page, ['input[name="commit"]',
+                                        'button[type="submit"]',
+                                        'input[type="submit"]'])
+                    continue
+                return "ERROR", ("GitHub showed a password form but no identity "
+                                 "provider button and no usable github_password.")
+            # IdP button may not be rendered yet; loop to let it appear.
             continue
 
         # ---- GitHub: 2FA -----------------------------------------------------
@@ -270,7 +348,8 @@ def attempt_login(page, cfg, github_username, azure_login, azure_password,
         return "SUCCESS", f"Signed in to GitHub (url={page.url})"
     return ("ERROR",
             f"Could not determine outcome. Final url={page.url}. "
-            f"(ms_user={filled_ms_user}, ms_pass={filled_ms_pass}, gh={filled_gh})")
+            f"(gh_user={filled_gh_user}, idp={clicked_idp}, "
+            f"ms_user={filled_ms_user}, ms_secret={filled_ms_secret})")
 
 
 def _click_first(page, selectors):
@@ -283,6 +362,65 @@ def _click_first(page, selectors):
         except Exception:
             continue
     return False
+
+
+def _click_identity_provider(page):
+    """Click GitHub's "Sign in with your identity provider" button/link.
+
+    On github.com/login the submit control is an <input type="submit"> whose
+    *value* becomes "Sign in with your identity provider" once an EMU username
+    has been typed, so match on the value attribute as well as link/button text.
+    """
+    selectors = [
+        'input[type="submit"][value*="identity provider" i]',
+        'input[value*="identity provider" i]',
+        'a:has-text("Sign in with your identity provider")',
+        'button:has-text("Sign in with your identity provider")',
+        'a:has-text("identity provider")',
+        'button:has-text("identity provider")',
+        'a:has-text("Single sign-on")',
+        'a[href*="/sso"]',
+    ]
+    return _click_first(page, selectors)
+
+
+# The Temporary Access Pass is entered on Microsoft's own screen. Depending on
+# the tenant it appears in a dedicated "accesspass" box, in the generic OTC box,
+# or simply in the standard password box.
+_TAP_FIELD_SELECTORS = [
+    'input[name="accesspass"]',
+    'input[placeholder*="Temporary Access Pass" i]',
+    'input[placeholder*="access pass" i]',
+]
+
+
+def _azure_secret_field(page):
+    """
+    Return the selector of the field where the TAP / password should be typed,
+    or None if no such field is currently visible.
+    """
+    for sel in _TAP_FIELD_SELECTORS:
+        if _visible(page, sel, timeout=600):
+            return sel
+    # If the page is clearly a TAP screen, the OTC box is the place to type it.
+    if _text_present(page, ["temporary access pass"]) and \
+            _visible(page, "#idTxtBx_SAOTCC_OTC", timeout=600):
+        return "#idTxtBx_SAOTCC_OTC"
+    # Standard "Enter password" box (also accepts a TAP in many tenants).
+    if _visible(page, 'input[name="passwd"]', timeout=600):
+        return 'input[name="passwd"]'
+    return None
+
+
+def _switch_to_tap(page):
+    """Click a "Use your Temporary Access Pass instead" style link, if present."""
+    selectors = [
+        'a:has-text("Temporary Access Pass")',
+        'button:has-text("Temporary Access Pass")',
+        'a:has-text("Use a Temporary Access Pass")',
+        '#idA_PWD_SwitchToCredPicker',
+    ]
+    return _click_first(page, selectors)
 
 
 def _logged_into_github(page, github_username):
@@ -411,6 +549,7 @@ def main():
         for row in sheet.iter_rows():
             gh_user = sheet.get(row, "github_username", required=False)
             az_login = sheet.get(row, "azure_login", required=False)
+            az_tap = sheet.get(row, "azure_tap", required=False)
             az_pass = sheet.get(row, "azure_password", required=False)
             gh_pass = sheet.get(row, "github_password", required=False)
 
@@ -426,9 +565,10 @@ def main():
                       f"(use --recheck to redo)")
                 continue
 
-            if not az_login or not az_pass:
+            if not az_login or not (az_tap or az_pass):
                 sheet.set(row, "status", "SKIPPED")
-                sheet.set(row, "detail", "Missing azure_login or azure_password")
+                sheet.set(row, "detail",
+                          "Missing userPrincipalName or TAP/password")
                 sheet.set(row, "checked_at", datetime.now().isoformat(timespec="seconds"))
                 sheet.save(excel_path)
                 print(f"[skip] row {row}: missing credentials")
@@ -443,7 +583,7 @@ def main():
             page.set_default_navigation_timeout(cfg["nav_timeout_ms"])
             try:
                 status, detail = attempt_login(
-                    page, cfg, gh_user or "", az_login, az_pass, gh_pass)
+                    page, cfg, gh_user or "", az_login, az_tap, az_pass, gh_pass)
             except Exception as e:  # noqa: BLE001
                 status, detail = "ERROR", f"Unhandled exception: {e!r}"
             finally:
