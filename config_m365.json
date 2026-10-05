@@ -1,0 +1,29 @@
+{
+  "excel_file": "NCSC-Users.xlsx",
+  "sheet_name": ["Users", "Admins"],
+
+  "check_github": false,
+  "check_windows365": false,
+  "check_copilot": false,
+  "check_powerautomate": false,
+  "check_m365": true,
+
+  "m365_url": "https://m365.cloud.microsoft/",
+  "m365_portal_host": "m365.cloud.microsoft",
+
+  "columns": {
+    "azure_login": "userPrincipalName",
+    "azure_tap": "tap",
+    "azure_password": "password",
+    "m365_status": "m365_status",
+    "m365_detail": "m365_detail",
+    "checked_at": "checked_at"
+  },
+
+  "headless": false,
+  "slow_mo_ms": 0,
+  "nav_timeout_ms": 30000,
+  "step_timeout_ms": 20000,
+  "between_users_delay_ms": 1500,
+  "clear_session_between_users": true
+}

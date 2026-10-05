@@ -70,7 +70,46 @@ def load_config(path: str) -> dict:
         "between_users_delay_ms": 1500,
         "success_url_substring": "github.com",
         "clear_session_between_users": True,
+
+        # Which checks to run per user.
+        "check_github": True,
+        "check_windows365": False,
+        "check_copilot": False,
+        "check_powerautomate": False,
+        "check_m365": False,
+        "check_cowork": False,
+
+        # Windows 365 portal check settings.
+        "windows365_url": "https://windows365.microsoft.com/",
+        "windows365_portal_host": "windows.cloud.microsoft",
+
+        # Copilot Studio portal check settings.
+        "copilot_url": "https://copilotstudio.microsoft.com/",
+        "copilot_portal_host": "copilotstudio.microsoft.com",
+
+        # Power Automate portal check settings.
+        "powerautomate_url": "https://make.powerautomate.com/",
+        "powerautomate_portal_host": "make.powerautomate.com",
+
+        # Microsoft 365 portal check settings.
+        "m365_url": "https://m365.cloud.microsoft/?auth=2",
+        "m365_portal_host": "m365.cloud.microsoft",
+
+        # Cowork (Microsoft 365) access check settings.
+        "cowork_url": "https://m365.cloud.microsoft/cowork",
     }
+    # Default names for the per-check output columns (created only when the
+    # relevant check is enabled).
+    defaults["columns"]["w365_status"] = "w365_status"
+    defaults["columns"]["w365_detail"] = "w365_detail"
+    defaults["columns"]["copilot_status"] = "copilot_status"
+    defaults["columns"]["copilot_detail"] = "copilot_detail"
+    defaults["columns"]["pa_status"] = "pa_status"
+    defaults["columns"]["pa_detail"] = "pa_detail"
+    defaults["columns"]["m365_status"] = "m365_status"
+    defaults["columns"]["m365_detail"] = "m365_detail"
+    defaults["columns"]["cowork_status"] = "cowork_status"
+    defaults["columns"]["cowork_detail"] = "cowork_detail"
     cfg_path = Path(path)
     if cfg_path.exists():
         user_cfg = json.loads(cfg_path.read_text())
@@ -87,10 +126,13 @@ def load_config(path: str) -> dict:
 class Sheet:
     """Thin wrapper around an openpyxl worksheet with header-name access."""
 
-    def __init__(self, wb, ws, col_cfg):
+    def __init__(self, wb, ws, col_cfg, output_keys=None):
         self.wb = wb
         self.ws = ws
         self.col_cfg = col_cfg
+        # Which output columns to create if missing. Defaults to the GitHub
+        # check's columns for backwards compatibility.
+        self.output_keys = output_keys or ("status", "detail", "checked_at")
         self.header_row = 1
         self.headers = {}  # normalized header name -> column index (1-based)
         self._read_headers()
@@ -102,9 +144,13 @@ class Sheet:
                 self.headers[str(cell.value).strip()] = idx
 
     def _ensure_output_columns(self):
-        """Make sure status/detail/checked_at columns exist; create if missing."""
-        for key in ("status", "detail", "checked_at"):
-            name = self.col_cfg[key]
+        """Create any configured output columns that are missing. Only the keys
+        in self.output_keys are created, so a sheet that runs one check doesn't
+        gain columns for the other."""
+        for key in self.output_keys:
+            name = self.col_cfg.get(key)
+            if not name:
+                continue
             if name not in self.headers:
                 new_idx = (max(self.headers.values()) if self.headers else 0) + 1
                 self.ws.cell(row=self.header_row, column=new_idx, value=name)
@@ -506,6 +552,433 @@ def _github_error(page):
 
 
 # --------------------------------------------------------------------------- #
+# Windows 365 portal check
+# --------------------------------------------------------------------------- #
+# The portal at windows365.microsoft.com redirects (after Azure AD sign-in) to
+# the Windows App web client at windows.cloud.microsoft, where the user's Cloud
+# PCs are listed under "Devices". Each Cloud PC renders a card whose test-id
+# starts with "cloudPC-card-" and a connect button test-id "cloudpc-trigger-
+# connect"; its aria-label reads "Connect to <name>. Press Enter to connect".
+_W365_CARD_SELECTOR = ('[data-testid^="cloudPC-card-"], '
+                       '[data-testid="cloudpc-trigger-connect"]')
+
+
+def _w365_cloud_pcs(page):
+    """Return a list of Cloud PC display names visible on the Devices page."""
+    try:
+        return page.evaluate(
+            """() => {
+                const names = new Set();
+                document.querySelectorAll(
+                    '[data-testid="cloudpc-trigger-connect"],'
+                    + '[data-testid^="cloudPC-card-"]'
+                ).forEach(e => {
+                    let n = e.getAttribute('aria-label') || e.innerText || '';
+                    n = n.replace(/^Connect to\\s*/i, '')
+                         .replace(/\\.\\s*Press Enter.*$/i, '')
+                         .replace(/\\s+/g, ' ').trim();
+                    if (n) names.add(n);
+                });
+                return Array.from(names);
+            }"""
+        ) or []
+    except Exception:
+        return []
+
+
+def _w365_power_state(page):
+    """Best-effort read of a Cloud PC's power/status hint, or '' if none."""
+    for sel in ['[data-testid="icon-status-indicator-button"]',
+                '[data-testid^="cpc-status-indicator-"]']:
+        try:
+            loc = page.locator(sel).first
+            if loc.count() > 0:
+                label = (loc.get_attribute("aria-label") or "").strip()
+                if label:
+                    return label
+        except Exception:
+            continue
+    return ""
+
+
+def check_windows365(page, cfg, azure_login, azure_tap, azure_password):
+    """
+    Sign in to the Windows 365 portal with the UPN + Temporary Access Pass and
+    report whether a Cloud PC exists for the user. Returns (status, detail).
+
+    status in {SUCCESS, NO_CLOUDPC, FAILED, MFA_REQUIRED, ERROR}.
+      SUCCESS    - at least one Windows 365 Cloud PC is present for the user.
+      NO_CLOUDPC - signed in, but the user has no Cloud PC assigned.
+      FAILED     - Azure AD rejected the sign-in.
+      MFA_REQUIRED / ERROR - as for the GitHub check.
+    """
+    step_to = cfg["step_timeout_ms"]
+    portal_host = cfg.get("windows365_portal_host", "windows.cloud.microsoft")
+
+    azure_secret = azure_tap or azure_password
+    secret_kind = "TAP" if azure_tap else "password"
+    if not azure_secret:
+        return "ERROR", "Row has neither a Temporary Access Pass nor a password."
+
+    page.set_default_timeout(step_to)
+    try:
+        page.goto(cfg.get("windows365_url", "https://windows365.microsoft.com/"),
+                  wait_until="domcontentloaded", timeout=cfg["nav_timeout_ms"])
+    except PWTimeout:
+        return "ERROR", "Timed out loading the Windows 365 portal."
+
+    filled_ms_user = False
+    filled_ms_secret = False
+    secret_submits = 0
+
+    # Phase 1: drive the Azure AD sign-in until we land on the portal host.
+    for _ in range(32):
+        page.wait_for_timeout(600)
+        url = page.url.lower()
+
+        if portal_host in url:
+            break
+
+        ms_err = _microsoft_error(page)
+        if ms_err:
+            return "FAILED", f"Azure AD rejected sign-in: {ms_err}"
+
+        if _visible(page, 'input[name="loginfmt"]', timeout=700) and not filled_ms_user:
+            if not _fill_and_verify(page, 'input[name="loginfmt"]', azure_login):
+                return "ERROR", ("Azure AD username field was not editable "
+                                 "(possible bot challenge).")
+            _click_first(page, ['#idSIButton9', 'input[type="submit"]',
+                                'button[type="submit"]'])
+            filled_ms_user = True
+            continue
+
+        if filled_ms_user:
+            secret_sel = _azure_secret_field(page)
+            if secret_sel:
+                if not _fill_and_verify(page, secret_sel, azure_secret):
+                    return "ERROR", (f"Azure AD {secret_kind} field was not "
+                                     "editable (possible bot challenge).")
+                _click_first(page, ['#idSIButton9', '#idA_SAOTCC_Continue',
+                                    'input[type="submit"]', 'button[type="submit"]'])
+                filled_ms_secret = True
+                secret_submits += 1
+                if secret_submits > 3:
+                    return "FAILED", f"Azure AD did not accept the {secret_kind}."
+                continue
+
+        if azure_tap and _switch_to_tap(page):
+            continue
+
+        if _is_mfa_challenge(page):
+            return ("MFA_REQUIRED",
+                    "Azure AD requested MFA / additional verification "
+                    "(cannot be completed unattended).")
+
+        # "Stay signed in?" — only after the secret, and detected by its own
+        # text (never by the generic submit button, which also appears on the
+        # username screen). Click Yes to carry the session into the portal.
+        if filled_ms_secret and _text_present(page, ["stay signed in"]):
+            if not _click_first(page, ["#idSIButton9"]):
+                _click_first(page, ["#idBtn_Back"])
+            continue
+    else:
+        return ("ERROR",
+                f"Did not reach the Windows 365 portal. Final url={page.url} "
+                f"(ms_user={filled_ms_user}, ms_secret={filled_ms_secret}).")
+
+    # Phase 2: on the portal — dismiss the first-run tour, open Devices,
+    # and look for a Cloud PC.
+    try:
+        page.wait_for_selector('[data-testid="nav-devices"]',
+                               timeout=cfg["nav_timeout_ms"])
+    except PWTimeout:
+        return "ERROR", "Windows 365 portal did not finish loading (no navigation)."
+    page.wait_for_timeout(1500)
+
+    # The guided-tour overlay (Next / Not now) can sit over the nav.
+    for _ in range(3):
+        if _click_first(page, ['[data-testid="not-now-button"]',
+                               'button:has-text("Not now")']):
+            page.wait_for_timeout(1200)
+            break
+        if _click_first(page, ['[data-testid="next-button"]']):
+            page.wait_for_timeout(900)
+            continue
+        break
+
+    _click_first(page, ['[data-testid="nav-devices"]',
+                        'button:has-text("Go to devices")'])
+
+    # Give the device list time to load, then poll for a Cloud PC card.
+    names = []
+    for _ in range(12):
+        page.wait_for_timeout(1000)
+        names = _w365_cloud_pcs(page)
+        if names:
+            break
+
+    if names:
+        state = _w365_power_state(page)
+        detail = f"Cloud PC present: {', '.join(names)}"
+        if state:
+            detail += f" ({state})"
+        return "SUCCESS", detail
+
+    # No card found. Distinguish "no Cloud PC" from a page that never rendered.
+    if _text_present(page, ["no cloud pc", "don't have", "do not have",
+                            "no devices", "nothing here", "no resources"]):
+        return "NO_CLOUDPC", "Signed in, but no Windows 365 Cloud PC is assigned."
+    if _visible(page, _W365_CARD_SELECTOR, timeout=800):
+        return "SUCCESS", "Cloud PC present."
+    return "NO_CLOUDPC", ("Signed in to the portal, but no Cloud PC was found on "
+                          "the Devices page.")
+
+
+# --------------------------------------------------------------------------- #
+# Copilot Studio portal check
+# --------------------------------------------------------------------------- #
+# copilotstudio.microsoft.com signs in via Azure AD and then the SPA itself
+# performs a *second* token acquisition, so the login screens (UPN + TAP) can
+# appear twice before the app loads. Success is the authenticated app route,
+# e.g. .../environments/~personal/home.
+_AZURE_FATAL_ERR = ("incorrect", "isn't recogniz", "does not exist",
+                    "couldn't find", "can't find", "cannot find",
+                    "account or password", "didn't work", "locked",
+                    "blocked", "disabled", "expired", "invalid")
+
+
+def _azure_error_is_fatal(text):
+    low = (text or "").lower()
+    return any(k in low for k in _AZURE_FATAL_ERR)
+
+
+# Signals that a Microsoft web app is authenticated. Classic Office portals show
+# the "me control" / account manager; the newer *.cloud.microsoft Copilot apps
+# (m365 / cowork) instead show a waffle app-launcher, a nav footer and a
+# "<name>, Work account" control.
+_AUTHED_SELECTORS = ('[aria-label^="Account manager"]',
+                     'button[aria-label*="Account manager" i]',
+                     '[data-automationid="meControl"]',
+                     '#meControlButton',
+                     '[data-testid="app-launcher-waffle-button"]',
+                     '[aria-label*="Work account" i]',
+                     '[data-testid="nav-footer"]')
+
+
+def _portal_authed(page):
+    for sel in _AUTHED_SELECTORS:
+        try:
+            if page.locator(sel).count() > 0:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _check_portal_login(page, cfg, azure_login, azure_tap, azure_password,
+                        *, url_start, host, label, require_path=(),
+                        require_authed=False):
+    """
+    Generic "can this user sign in to a Microsoft web portal" check. Drives the
+    Azure AD UPN + Temporary Access Pass flow (handling the repeat auth round
+    that SPAs like Copilot Studio / Power Automate perform) until the
+    authenticated app loads on `host`. Returns (status, detail).
+
+    require_path: optional substrings; if given, success also requires the URL
+    path to contain one of them (guards against a brief pre-auth landing on the
+    same host before the app bounces back to the login page).
+    require_authed: if True, success also requires an authenticated UI signal
+    (the account-manager control). Needed for portals like m365.cloud.microsoft
+    that render an anonymous marketing page on the same host.
+
+    status in {SUCCESS, FAILED, MFA_REQUIRED, ERROR}.
+    """
+    azure_secret = azure_tap or azure_password
+    secret_kind = "TAP" if azure_tap else "password"
+    if not azure_secret:
+        return "ERROR", "Row has neither a Temporary Access Pass nor a password."
+
+    page.set_default_timeout(cfg["step_timeout_ms"])
+    try:
+        page.goto(url_start, wait_until="domcontentloaded",
+                  timeout=cfg["nav_timeout_ms"])
+    except PWTimeout:
+        return "ERROR", f"Timed out loading the {label} portal."
+
+    secret_submits = 0
+    login_rounds = 0
+    stable = 0
+
+    def _path_ok(url):
+        return (not require_path) or any(s in url for s in require_path)
+
+    for _ in range(90):
+        page.wait_for_timeout(700)
+        url = page.url.lower()
+        on_login = ("microsoftonline" in url) or ("login.live" in url)
+
+        # Only a clear credential-rejection message is fatal; transient
+        # "enter a valid email" flashes between rounds are ignored.
+        ms_err = _microsoft_error(page)
+        if ms_err and _azure_error_is_fatal(ms_err):
+            return "FAILED", f"Azure AD rejected sign-in: {ms_err}"
+
+        # Success: on the app host, not on a login page, no sign-in field, and
+        # (if required) on an authenticated route / showing an authed signal.
+        on_host = (host in url and not on_login and _path_ok(url)
+                   and not _visible(page, 'input[name="loginfmt"]', 300))
+        if on_host and (not require_authed or _portal_authed(page)):
+            stable += 1
+            if stable >= 4:
+                return "SUCCESS", f"Signed in to {label} (url={page.url})"
+            continue
+        stable = 0
+
+        # Anonymous marketing landing on the app host (require_authed portals):
+        # click "Sign in" to kick off the org auth.
+        if on_host and require_authed and not _portal_authed(page):
+            if _click_first(page, ['a[href*="/login"]', 'a:has-text("Sign in")',
+                                   'button:has-text("Sign in")']):
+                continue
+
+        # Azure: username (may appear more than once).
+        if _visible(page, 'input[name="loginfmt"]', 500):
+            if _field_value(page, 'input[name="loginfmt"]') != azure_login:
+                if not _fill_and_verify(page, 'input[name="loginfmt"]', azure_login):
+                    return "ERROR", ("Azure AD username field was not editable "
+                                     "(possible bot challenge).")
+            _click_first(page, ['#idSIButton9', 'input[type="submit"]',
+                                'button[type="submit"]'])
+            login_rounds += 1
+            if login_rounds > 4:
+                return "ERROR", "Azure AD kept asking for the username."
+            continue
+
+        # Azure: Temporary Access Pass / password.
+        secret_sel = _azure_secret_field(page) if on_login else None
+        if secret_sel:
+            if not _fill_and_verify(page, secret_sel, azure_secret):
+                return "ERROR", (f"Azure AD {secret_kind} field was not editable "
+                                 "(possible bot challenge).")
+            _click_first(page, ['#idSIButton9', '#idA_SAOTCC_Continue',
+                                'input[type="submit"]', 'button[type="submit"]'])
+            secret_submits += 1
+            if secret_submits > 5:
+                return "FAILED", f"Azure AD did not accept the {secret_kind}."
+            continue
+
+        if azure_tap and _switch_to_tap(page):
+            continue
+
+        if _is_mfa_challenge(page):
+            return ("MFA_REQUIRED",
+                    "Azure AD requested MFA / additional verification "
+                    "(cannot be completed unattended).")
+
+        # "Stay signed in?" — Yes, so the session carries into the app's second
+        # token request (avoids an endless re-prompt loop).
+        if on_login and _text_present(page, ["stay signed in"]):
+            if not _click_first(page, ["#idSIButton9"]):
+                _click_first(page, ["#idBtn_Back"])
+            continue
+
+        # OAuth consent / permissions prompt.
+        if _click_first(page, ['input[value="Accept"]',
+                               'button:has-text("Accept")',
+                               'button:has-text("Allow")',
+                               'button:has-text("Yes")']):
+            continue
+
+    # Ran out of iterations.
+    final = page.url.lower()
+    if (host in final and not (("microsoftonline" in final) or ("login.live" in final))
+            and _path_ok(final) and (not require_authed or _portal_authed(page))):
+        return "SUCCESS", f"Signed in to {label} (url={page.url})"
+    return ("ERROR",
+            f"Did not reach the {label} app. Final url={page.url} "
+            f"(login_rounds={login_rounds}, secret_submits={secret_submits}).")
+
+
+def check_copilot_studio(page, cfg, azure_login, azure_tap, azure_password):
+    """Sign-in check for Copilot Studio (reaches .../environments/.../home)."""
+    return _check_portal_login(
+        page, cfg, azure_login, azure_tap, azure_password,
+        url_start=cfg.get("copilot_url", "https://copilotstudio.microsoft.com/"),
+        host=cfg.get("copilot_portal_host", "copilotstudio.microsoft.com"),
+        label="Copilot Studio",
+        require_path=("/environments/", "/home"))
+
+
+def check_power_automate(page, cfg, azure_login, azure_tap, azure_password):
+    """Sign-in check for Power Automate (make.powerautomate.com)."""
+    return _check_portal_login(
+        page, cfg, azure_login, azure_tap, azure_password,
+        url_start=cfg.get("powerautomate_url", "https://make.powerautomate.com/"),
+        host=cfg.get("powerautomate_portal_host", "make.powerautomate.com"),
+        label="Power Automate",
+        require_path=())
+
+
+def check_m365(page, cfg, azure_login, azure_tap, azure_password):
+    """Sign-in check for the Microsoft 365 portal (m365.cloud.microsoft).
+
+    Note: m365.cloud.microsoft shows an anonymous marketing page by default, so
+    we deep-link to a protected route (?auth=2) to force the org sign-in."""
+    return _check_portal_login(
+        page, cfg, azure_login, azure_tap, azure_password,
+        url_start=cfg.get("m365_url", "https://m365.cloud.microsoft/?auth=2"),
+        host=cfg.get("m365_portal_host", "m365.cloud.microsoft"),
+        label="Microsoft 365",
+        require_authed=True)
+
+
+def check_cowork(page, cfg, azure_login, azure_tap, azure_password):
+    """
+    Check whether the user has access to Cowork on the Microsoft 365 portal.
+    Signs in (UPN + TAP), opens m365.cloud.microsoft/cowork, and looks for the
+    access banner ("You have access to Cowork"). Returns (status, detail).
+
+    status in {SUCCESS, NO_ACCESS, FAILED, MFA_REQUIRED, ERROR}.
+      SUCCESS   - the user has access to Cowork.
+      NO_ACCESS - signed in, but Cowork is not available to the user.
+    """
+    cowork_url = cfg.get("cowork_url", "https://m365.cloud.microsoft/cowork")
+    host = cfg.get("m365_portal_host", "m365.cloud.microsoft")
+
+    # Reuse the shared Azure login to reach an authenticated m365 session.
+    status, detail = _check_portal_login(
+        page, cfg, azure_login, azure_tap, azure_password,
+        url_start=cowork_url, host=host, label="Cowork (Microsoft 365)",
+        require_authed=True)
+    if status != "SUCCESS":
+        return status, detail
+
+    # Make sure we're on the Cowork route, then read the access banner.
+    try:
+        if "cowork" not in page.url.lower():
+            page.goto(cowork_url, wait_until="domcontentloaded",
+                      timeout=cfg["nav_timeout_ms"])
+    except PWTimeout:
+        return "ERROR", "Timed out loading the Cowork page."
+
+    has_text = ("you have access to cowork", "great news")
+    no_text = ("don't have access", "do not have access", "no access to cowork",
+               "not licensed", "isn't available", "is not available",
+               "request access", "doesn't have access")
+    # Poll briefly while the Cowork page renders its banner.
+    for _ in range(12):
+        page.wait_for_timeout(1000)
+        if _text_present(page, has_text):
+            return "SUCCESS", "User has access to Cowork."
+        if _text_present(page, no_text):
+            return "NO_ACCESS", "Signed in, but no access to Cowork."
+
+    # Banner never appeared — report what we ended on rather than guessing.
+    return "NO_ACCESS", ("Signed in, but the Cowork access banner was not found "
+                         f"(url={page.url}).")
+
+
+# --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
 def main():
@@ -515,7 +988,8 @@ def main():
     parser.add_argument("--headless", action="store_true",
                         help="override config to run without a visible browser")
     parser.add_argument("--only", default=None,
-                        help="comma-separated github_usernames to test (others skipped)")
+                        help="comma-separated usernames (GitHub username or UPN) "
+                             "to test; others skipped")
     parser.add_argument("--recheck", action="store_true",
                         help="re-test rows that already have a status")
     args = parser.parse_args()
@@ -523,6 +997,16 @@ def main():
     cfg = load_config(args.config)
     if args.headless:
         cfg["headless"] = True
+
+    do_github = bool(cfg.get("check_github", True))
+    do_w365 = bool(cfg.get("check_windows365", False))
+    do_copilot = bool(cfg.get("check_copilot", False))
+    do_pa = bool(cfg.get("check_powerautomate", False))
+    do_m365 = bool(cfg.get("check_m365", False))
+    do_cowork = bool(cfg.get("check_cowork", False))
+    if not (do_github or do_w365 or do_copilot or do_pa or do_m365 or do_cowork):
+        print("ERROR: all checks are disabled in config.", file=sys.stderr)
+        sys.exit(2)
 
     only = None
     if args.only:
@@ -534,88 +1018,263 @@ def main():
         print("Run `python make_template.py` to create a starter file.", file=sys.stderr)
         sys.exit(2)
 
+    # Which sheets to process: a name, a list of names, or None (active sheet).
     wb = load_workbook(excel_path)
-    ws = wb[cfg["sheet_name"]] if cfg["sheet_name"] else wb.active
-    sheet = Sheet(wb, ws, cfg["columns"])
+    sheet_cfg = cfg.get("sheet_name")
+    if isinstance(sheet_cfg, list):
+        sheet_names = sheet_cfg
+    elif sheet_cfg:
+        sheet_names = [sheet_cfg]
+    else:
+        sheet_names = [wb.active.title]
+
+    output_keys = ["checked_at"]
+    if do_github:
+        output_keys = ["status", "detail"] + output_keys
+    if do_w365:
+        output_keys = ["w365_status", "w365_detail"] + output_keys
+    if do_copilot:
+        output_keys = ["copilot_status", "copilot_detail"] + output_keys
+    if do_pa:
+        output_keys = ["pa_status", "pa_detail"] + output_keys
+    if do_m365:
+        output_keys = ["m365_status", "m365_detail"] + output_keys
+    if do_cowork:
+        output_keys = ["cowork_status", "cowork_detail"] + output_keys
+
+    totals = {"github": {"SUCCESS": 0, "FAILED": 0, "other": 0},
+              "w365": {"SUCCESS": 0, "FAILED": 0, "other": 0},
+              "copilot": {"SUCCESS": 0, "FAILED": 0, "other": 0},
+              "pa": {"SUCCESS": 0, "FAILED": 0, "other": 0},
+              "m365": {"SUCCESS": 0, "FAILED": 0, "other": 0},
+              "cowork": {"SUCCESS": 0, "FAILED": 0, "other": 0}}
+    tested = 0
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=cfg["headless"],
                                     slow_mo=cfg["slow_mo_ms"])
-        context = None
+        shared_context = None
         if not cfg["clear_session_between_users"]:
-            context = browser.new_context()
+            shared_context = browser.new_context()
 
-        total = ok = failed = other = 0
-        for row in sheet.iter_rows():
-            gh_user = sheet.get(row, "github_username", required=False)
-            az_login = sheet.get(row, "azure_login", required=False)
-            az_tap = sheet.get(row, "azure_tap", required=False)
-            az_pass = sheet.get(row, "azure_password", required=False)
-            gh_pass = sheet.get(row, "github_password", required=False)
-
-            if not gh_user and not az_login:
-                continue  # blank row
-
-            if only is not None and gh_user not in only:
+        for sheet_name in sheet_names:
+            if sheet_name not in wb.sheetnames:
+                print(f"[warn] sheet '{sheet_name}' not found; skipping.")
                 continue
+            sheet = Sheet(wb, wb[sheet_name], cfg["columns"], output_keys)
+            print(f"\n==== Sheet: {sheet_name} ====")
 
-            existing_status = sheet.get(row, "status", required=False)
-            if existing_status and not args.recheck:
-                print(f"[skip] {gh_user or az_login}: already '{existing_status}' "
-                      f"(use --recheck to redo)")
-                continue
+            for row in sheet.iter_rows():
+                gh_user = sheet.get(row, "github_username", required=False) if do_github else None
+                az_login = sheet.get(row, "azure_login", required=False)
+                az_tap = sheet.get(row, "azure_tap", required=False)
+                az_pass = sheet.get(row, "azure_password", required=False)
+                gh_pass = sheet.get(row, "github_password", required=False) if do_github else None
 
-            if not az_login or not (az_tap or az_pass):
-                sheet.set(row, "status", "SKIPPED")
-                sheet.set(row, "detail",
-                          "Missing userPrincipalName or TAP/password")
-                sheet.set(row, "checked_at", datetime.now().isoformat(timespec="seconds"))
-                sheet.save(excel_path)
-                print(f"[skip] row {row}: missing credentials")
-                continue
+                if not gh_user and not az_login:
+                    continue  # blank row
 
-            total += 1
-            label = gh_user or az_login
-            print(f"[test] {label} ...", flush=True)
+                if only is not None and gh_user not in only and az_login not in only:
+                    continue
 
-            per_user_ctx = context or browser.new_context()
-            page = per_user_ctx.new_page()
-            page.set_default_navigation_timeout(cfg["nav_timeout_ms"])
-            try:
-                status, detail = attempt_login(
-                    page, cfg, gh_user or "", az_login, az_tap, az_pass, gh_pass)
-            except Exception as e:  # noqa: BLE001
-                status, detail = "ERROR", f"Unhandled exception: {e!r}"
-            finally:
-                page.close()
-                if context is None:
-                    per_user_ctx.close()
+                # Per-check skip: only run a check that hasn't been done (unless
+                # --recheck). A row is skipped only when nothing is left to do.
+                gh_done = sheet.get(row, "status", required=False) if do_github else None
+                w_done = sheet.get(row, "w365_status", required=False) if do_w365 else None
+                cp_done = sheet.get(row, "copilot_status", required=False) if do_copilot else None
+                pa_done = sheet.get(row, "pa_status", required=False) if do_pa else None
+                m_done = sheet.get(row, "m365_status", required=False) if do_m365 else None
+                cw_done = sheet.get(row, "cowork_status", required=False) if do_cowork else None
+                need_github = do_github and (args.recheck or not gh_done)
+                need_w365 = do_w365 and (args.recheck or not w_done)
+                need_copilot = do_copilot and (args.recheck or not cp_done)
+                need_pa = do_pa and (args.recheck or not pa_done)
+                need_m365 = do_m365 and (args.recheck or not m_done)
+                need_cowork = do_cowork and (args.recheck or not cw_done)
+                if not (need_github or need_w365 or need_copilot or need_pa
+                        or need_m365 or need_cowork):
+                    print(f"[skip] {gh_user or az_login}: already done "
+                          f"(use --recheck to redo)")
+                    continue
 
-            sheet.set(row, "status", status)
-            sheet.set(row, "detail", detail)
-            sheet.set(row, "checked_at", datetime.now().isoformat(timespec="seconds"))
-            sheet.save(excel_path)  # save after each user so progress is never lost
+                if not az_login or not (az_tap or az_pass):
+                    miss = "Missing userPrincipalName or TAP/password"
+                    if need_github:
+                        sheet.set(row, "status", "SKIPPED")
+                        sheet.set(row, "detail", miss)
+                    if need_w365:
+                        sheet.set(row, "w365_status", "SKIPPED")
+                        sheet.set(row, "w365_detail", miss)
+                    if need_copilot:
+                        sheet.set(row, "copilot_status", "SKIPPED")
+                        sheet.set(row, "copilot_detail", miss)
+                    if need_pa:
+                        sheet.set(row, "pa_status", "SKIPPED")
+                        sheet.set(row, "pa_detail", miss)
+                    if need_m365:
+                        sheet.set(row, "m365_status", "SKIPPED")
+                        sheet.set(row, "m365_detail", miss)
+                    if need_cowork:
+                        sheet.set(row, "cowork_status", "SKIPPED")
+                        sheet.set(row, "cowork_detail", miss)
+                    sheet.set(row, "checked_at", datetime.now().isoformat(timespec="seconds"))
+                    sheet.save(excel_path)
+                    print(f"[skip] row {row}: missing credentials")
+                    continue
 
-            if status == "SUCCESS":
-                ok += 1
-            elif status == "FAILED":
-                failed += 1
-            else:
-                other += 1
-            print(f"       -> {status}: {detail}")
+                tested += 1
+                label = gh_user or az_login
+                print(f"[test] {label} ...", flush=True)
 
-            time.sleep(cfg["between_users_delay_ms"] / 1000.0)
+                per_user_ctx = shared_context or browser.new_context()
+                try:
+                    if need_github:
+                        page = per_user_ctx.new_page()
+                        page.set_default_navigation_timeout(cfg["nav_timeout_ms"])
+                        try:
+                            status, detail = attempt_login(
+                                page, cfg, gh_user or "", az_login, az_tap, az_pass, gh_pass)
+                        except Exception as e:  # noqa: BLE001
+                            status, detail = "ERROR", f"Unhandled exception: {e!r}"
+                        finally:
+                            page.close()
+                        sheet.set(row, "status", status)
+                        sheet.set(row, "detail", detail)
+                        sheet.set(row, "checked_at", datetime.now().isoformat(timespec="seconds"))
+                        sheet.save(excel_path)
+                        _tally(totals["github"], status)
+                        print(f"       github -> {status}: {detail}")
 
-        if context is not None:
-            context.close()
+                    if need_w365:
+                        page = per_user_ctx.new_page()
+                        page.set_default_navigation_timeout(cfg["nav_timeout_ms"])
+                        try:
+                            status, detail = check_windows365(
+                                page, cfg, az_login, az_tap, az_pass)
+                        except Exception as e:  # noqa: BLE001
+                            status, detail = "ERROR", f"Unhandled exception: {e!r}"
+                        finally:
+                            page.close()
+                        sheet.set(row, "w365_status", status)
+                        sheet.set(row, "w365_detail", detail)
+                        sheet.set(row, "checked_at", datetime.now().isoformat(timespec="seconds"))
+                        sheet.save(excel_path)
+                        _tally(totals["w365"], status)
+                        print(f"       win365 -> {status}: {detail}")
+
+                    if need_copilot:
+                        page = per_user_ctx.new_page()
+                        page.set_default_navigation_timeout(cfg["nav_timeout_ms"])
+                        try:
+                            status, detail = check_copilot_studio(
+                                page, cfg, az_login, az_tap, az_pass)
+                        except Exception as e:  # noqa: BLE001
+                            status, detail = "ERROR", f"Unhandled exception: {e!r}"
+                        finally:
+                            page.close()
+                        sheet.set(row, "copilot_status", status)
+                        sheet.set(row, "copilot_detail", detail)
+                        sheet.set(row, "checked_at", datetime.now().isoformat(timespec="seconds"))
+                        sheet.save(excel_path)
+                        _tally(totals["copilot"], status)
+                        print(f"       copilot -> {status}: {detail}")
+
+                    if need_pa:
+                        page = per_user_ctx.new_page()
+                        page.set_default_navigation_timeout(cfg["nav_timeout_ms"])
+                        try:
+                            status, detail = check_power_automate(
+                                page, cfg, az_login, az_tap, az_pass)
+                        except Exception as e:  # noqa: BLE001
+                            status, detail = "ERROR", f"Unhandled exception: {e!r}"
+                        finally:
+                            page.close()
+                        sheet.set(row, "pa_status", status)
+                        sheet.set(row, "pa_detail", detail)
+                        sheet.set(row, "checked_at", datetime.now().isoformat(timespec="seconds"))
+                        sheet.save(excel_path)
+                        _tally(totals["pa"], status)
+                        print(f"       powerautomate -> {status}: {detail}")
+
+                    if need_m365:
+                        page = per_user_ctx.new_page()
+                        page.set_default_navigation_timeout(cfg["nav_timeout_ms"])
+                        try:
+                            status, detail = check_m365(
+                                page, cfg, az_login, az_tap, az_pass)
+                        except Exception as e:  # noqa: BLE001
+                            status, detail = "ERROR", f"Unhandled exception: {e!r}"
+                        finally:
+                            page.close()
+                        sheet.set(row, "m365_status", status)
+                        sheet.set(row, "m365_detail", detail)
+                        sheet.set(row, "checked_at", datetime.now().isoformat(timespec="seconds"))
+                        sheet.save(excel_path)
+                        _tally(totals["m365"], status)
+                        print(f"       m365 -> {status}: {detail}")
+
+                    if need_cowork:
+                        page = per_user_ctx.new_page()
+                        page.set_default_navigation_timeout(cfg["nav_timeout_ms"])
+                        try:
+                            status, detail = check_cowork(
+                                page, cfg, az_login, az_tap, az_pass)
+                        except Exception as e:  # noqa: BLE001
+                            status, detail = "ERROR", f"Unhandled exception: {e!r}"
+                        finally:
+                            page.close()
+                        sheet.set(row, "cowork_status", status)
+                        sheet.set(row, "cowork_detail", detail)
+                        sheet.set(row, "checked_at", datetime.now().isoformat(timespec="seconds"))
+                        sheet.save(excel_path)
+                        _tally(totals["cowork"], status)
+                        print(f"       cowork -> {status}: {detail}")
+                finally:
+                    if shared_context is None:
+                        per_user_ctx.close()
+
+                time.sleep(cfg["between_users_delay_ms"] / 1000.0)
+
+        if shared_context is not None:
+            shared_context.close()
         browser.close()
 
     print("\n==== Summary ====")
-    print(f"Tested : {total}")
-    print(f"SUCCESS: {ok}")
-    print(f"FAILED : {failed}")
-    print(f"Other  : {other} (MFA_REQUIRED / ERROR / SKIPPED)")
+    print(f"Users tested: {tested}")
+    if do_github:
+        g = totals["github"]
+        print(f"GitHub   -> SUCCESS: {g['SUCCESS']}  FAILED: {g['FAILED']}  "
+              f"Other: {g['other']}")
+    if do_w365:
+        w = totals["w365"]
+        print(f"Win365   -> SUCCESS: {w['SUCCESS']}  FAILED: {w['FAILED']}  "
+              f"Other: {w['other']} (NO_CLOUDPC / MFA_REQUIRED / ERROR / SKIPPED)")
+    if do_copilot:
+        cp = totals["copilot"]
+        print(f"Copilot  -> SUCCESS: {cp['SUCCESS']}  FAILED: {cp['FAILED']}  "
+              f"Other: {cp['other']} (MFA_REQUIRED / ERROR / SKIPPED)")
+    if do_pa:
+        pa = totals["pa"]
+        print(f"PowerAut -> SUCCESS: {pa['SUCCESS']}  FAILED: {pa['FAILED']}  "
+              f"Other: {pa['other']} (MFA_REQUIRED / ERROR / SKIPPED)")
+    if do_m365:
+        m = totals["m365"]
+        print(f"M365     -> SUCCESS: {m['SUCCESS']}  FAILED: {m['FAILED']}  "
+              f"Other: {m['other']} (MFA_REQUIRED / ERROR / SKIPPED)")
+    if do_cowork:
+        cw = totals["cowork"]
+        print(f"Cowork   -> SUCCESS: {cw['SUCCESS']}  FAILED: {cw['FAILED']}  "
+              f"Other: {cw['other']} (NO_ACCESS / MFA_REQUIRED / ERROR / SKIPPED)")
     print(f"Results written to: {excel_path.resolve()}")
+
+
+def _tally(counter, status):
+    if status == "SUCCESS":
+        counter["SUCCESS"] += 1
+    elif status == "FAILED":
+        counter["FAILED"] += 1
+    else:
+        counter["other"] += 1
 
 
 if __name__ == "__main__":

@@ -1,12 +1,100 @@
-# GitHub (Azure AD SSO) login checker
+# Access checker (GitHub SSO + Windows 365)
 
 Playwright automation that reads users from an Excel file and, for each one,
-drives a real browser through the **GitHub → Azure AD (Entra) SSO** login flow
-using a **userPrincipalName + Temporary Access Pass (TAP)**, then writes back
-whether that user could sign in.
+drives a real browser through Azure AD (Entra) using a **userPrincipalName +
+Temporary Access Pass (TAP)**, then writes the result back to the sheet. It can
+run two independent checks (toggled per config):
+
+- **GitHub SSO login** — GitHub → "Sign in with your identity provider" → Azure.
+- **Windows 365** — the Windows 365 portal, verifying the user has a Cloud PC.
 
 Intended for an admin verifying access for accounts in **their own**
 organization.
+
+## Two configs
+
+| Config                       | File                      | Checks             |
+|------------------------------|---------------------------|--------------------|
+| `config.json`                | `State of Maryland.xlsx`  | GitHub SSO login   |
+| `config_w365.json`           | `NCSC-Users.xlsx`         | Windows 365        |
+| `config_copilot.json`        | `NCSC-Users.xlsx`         | Copilot Studio     |
+| `config_powerautomate.json`  | `NCSC-Users.xlsx`         | Power Automate     |
+| `config_m365.json`           | `NCSC-Users.xlsx`         | Microsoft 365      |
+| `config_cowork.json`         | `NCSC-Users.xlsx`         | Cowork access (M365) |
+
+```bash
+./.venv/bin/python check_logins.py                                 # GitHub (config.json)
+./.venv/bin/python check_logins.py --config config_w365.json          # Windows 365
+./.venv/bin/python check_logins.py --config config_copilot.json       # Copilot Studio
+./.venv/bin/python check_logins.py --config config_powerautomate.json # Power Automate
+./.venv/bin/python check_logins.py --config config_m365.json          # Microsoft 365
+./.venv/bin/python check_logins.py --config config_cowork.json        # Cowork access
+```
+
+## Cowork access check
+
+Signs in to Microsoft 365 (UPN + TAP), opens `m365.cloud.microsoft/cowork`, and
+checks for the access banner **"You have access to Cowork"**. Results go to
+`cowork_status` / `cowork_detail`:
+
+| cowork_status | meaning                                                  |
+|---------------|----------------------------------------------------------|
+| `SUCCESS`     | The user has access to Cowork (access banner present).    |
+| `NO_ACCESS`   | Signed in, but the access banner was not found.           |
+| `FAILED`      | Azure AD rejected the sign-in.                            |
+| `MFA_REQUIRED` / `ERROR` / `SKIPPED` | as above.                         |
+
+> Note: `m365.cloud.microsoft` serves an anonymous marketing page by default, so
+> these checks deep-link to a protected route to force the org sign-in and verify
+> an authenticated signal before reading the page.
+
+## Portal sign-in checks (Copilot Studio / Power Automate / Microsoft 365)
+
+These are all the same kind of check: open the portal, sign in with
+`userPrincipalName` + `tap`, and confirm the authenticated app loads. They share
+one engine (`_check_portal_login`) that drives the Azure AD screens — including
+the repeat auth round that these SPAs perform — and clicks "Stay signed in →
+Yes". Each writes its own columns:
+
+| Portal          | URL                              | columns                       |
+|-----------------|----------------------------------|-------------------------------|
+| Copilot Studio  | `copilotstudio.microsoft.com`    | `copilot_status` / `copilot_detail` |
+| Power Automate  | `make.powerautomate.com`         | `pa_status` / `pa_detail`     |
+| Microsoft 365   | `m365.cloud.microsoft`           | `m365_status` / `m365_detail` |
+
+Status is `SUCCESS` (reached the authenticated app), `FAILED` (Azure rejected),
+`MFA_REQUIRED`, `ERROR`, or `SKIPPED`.
+
+## Copilot Studio check
+
+Opens `https://copilotstudio.microsoft.com/`, signs in with the
+`userPrincipalName` + `tap`, and (because the app performs a second token
+acquisition, so the UPN/TAP screens can appear twice) keeps driving the Azure
+screens until the authenticated app loads at
+`.../environments/.../home`. Results go to `copilot_status` / `copilot_detail`:
+
+| copilot_status | meaning                                               |
+|----------------|-------------------------------------------------------|
+| `SUCCESS`      | Reached the authenticated Copilot Studio app.         |
+| `FAILED`       | Azure AD rejected the sign-in.                        |
+| `MFA_REQUIRED` / `ERROR` / `SKIPPED` | as below.                       |
+
+## Windows 365 check
+
+For every row it opens `https://windows365.microsoft.com/`, signs in with the
+`userPrincipalName` + `tap`, follows the redirect to the Windows App portal
+(`windows.cloud.microsoft`), dismisses the first-run tour, opens **Devices**,
+and checks whether a **Cloud PC** is present. Results go to `w365_status` /
+`w365_detail`:
+
+| w365_status  | meaning                                                         |
+|--------------|-----------------------------------------------------------------|
+| `SUCCESS`    | A Windows 365 Cloud PC is present (name + power state recorded). |
+| `NO_CLOUDPC` | Signed in, but no Cloud PC is assigned to the user.             |
+| `FAILED`     | Azure AD rejected the sign-in.                                  |
+| `MFA_REQUIRED` / `ERROR` / `SKIPPED` | as below.                               |
+
+Both sheets of `NCSC-Users.xlsx` (`Users` and `Admins`) are processed.
 
 ## What it does
 

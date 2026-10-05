@@ -1,0 +1,27 @@
+{
+  "excel_file": "NCSC-Users.xlsx",
+  "sheet_name": ["Users", "Admins"],
+
+  "check_github": false,
+  "check_windows365": false,
+  "check_copilot": true,
+
+  "copilot_url": "https://copilotstudio.microsoft.com/",
+  "copilot_portal_host": "copilotstudio.microsoft.com",
+
+  "columns": {
+    "azure_login": "userPrincipalName",
+    "azure_tap": "tap",
+    "azure_password": "password",
+    "copilot_status": "copilot_status",
+    "copilot_detail": "copilot_detail",
+    "checked_at": "checked_at"
+  },
+
+  "headless": false,
+  "slow_mo_ms": 0,
+  "nav_timeout_ms": 30000,
+  "step_timeout_ms": 20000,
+  "between_users_delay_ms": 1500,
+  "clear_session_between_users": true
+}
